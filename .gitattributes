@@ -1,3 +1,4 @@
 * text=auto
 *.py text eol=lf
-*.cmd text eol=crlf
+# Batch files must keep CRLF in every download path (zip, raw), so git never converts them.
+*.cmd -text
