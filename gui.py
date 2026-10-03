@@ -27,7 +27,7 @@ from tkinter import messagebox, ttk
 import bridge as core
 
 APP_TITLE = "Prism Bridge"
-AUTHOR_NOTE = "作者 QQ 群 724686992"
+AUTHOR_NOTE = "作者 QQ 群 608041120"
 SETTINGS_FILE = core.PROFILE_DIR / "gui.json"
 # Set for the window's children: they exit when their stdin closes.
 CHILD_ENV = "PRISM_GUI_CHILD"

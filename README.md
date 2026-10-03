@@ -236,7 +236,7 @@ python bridge.py serve
 
 GitHub：[@yyyllllming](https://github.com/yyyllllming)
 
-QQ 交流群：`724686992`，群主即为作者。传播、转载、二次分发请标明原作者。
+QQ 交流群：`608041120`，群主即为作者。传播、转载、二次分发请标明原作者。
 
 本项目以 [MIT](LICENSE) 协议开源。
 
