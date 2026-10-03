@@ -192,10 +192,11 @@ def get_token_claims(cookie_str: str) -> dict:
             token = part.split("=", 1)[1]
             try:
                 payload = jwt_payload(token)
-                auth = payload.get("https://api.openai.com/auth", {})
+                auth = payload.get("https://api.openai.com/auth", {}) or {}
+                profile = payload.get("https://api.openai.com/profile", {}) or {}
                 claims["user_id"] = auth.get("chatgpt_user_id") or "user-unknown"
-                claims["email"] = payload.get("email")
-                claims["plan"] = auth.get("plan_type")
+                claims["email"] = payload.get("email") or profile.get("email")
+                claims["plan"] = auth.get("plan_type") or auth.get("chatgpt_plan_type")
                 claims["expires_at"] = payload.get("exp")
             except Exception:
                 pass

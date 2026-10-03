@@ -20,6 +20,7 @@ import time
 import tkinter as tk
 import urllib.error
 import urllib.request
+import webbrowser
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
@@ -27,7 +28,9 @@ from tkinter import messagebox, ttk
 import bridge as core
 
 APP_TITLE = "Prism Bridge"
-AUTHOR_NOTE = "作者 QQ 群 608041120"
+AUTHOR_NOTE = "taffy prism QQ群 608041120"
+TG_NOTE = "https://t.me/taffyvip"
+TG_LABEL = "频道：" + TG_NOTE
 SETTINGS_FILE = core.PROFILE_DIR / "gui.json"
 # Set for the window's children: they exit when their stdin closes.
 CHILD_ENV = "PRISM_GUI_CHILD"
@@ -119,8 +122,10 @@ def load_settings() -> dict:
 
 def save_settings(data: dict) -> None:
     try:
+        cur = load_settings()
+        cur.update(data)
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        SETTINGS_FILE.write_text(json.dumps(cur, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -207,8 +212,18 @@ class App:
         self.account_text.grid(row=0, column=1, sticky="w", padx=(6, 0))
         self.account_detail = ttk.Label(account, foreground=MUTED)
         self.account_detail.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
+        self.account_expiry = ttk.Label(account, foreground=MUTED)
+        self.account_expiry.grid(row=2, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(2, 0))
+        self._qq_font = tkfont.nametofont("TkDefaultFont").copy()
+        self._qq_font.configure(size=max(int(self._qq_font.cget("size")) + 2, 11))
+        links = ttk.Frame(account)
+        links.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 8))
+        ttk.Label(links, text=AUTHOR_NOTE, font=self._qq_font).pack(anchor="e")
+        tg = ttk.Label(links, text=TG_LABEL, font=self._qq_font, foreground="#0b57d0", cursor="hand2")
+        tg.pack(anchor="e", pady=(2, 0))
+        tg.bind("<Button-1>", lambda _e: webbrowser.open(TG_NOTE))
         self.login_btn = ttk.Button(account, width=12, command=self._on_login)
-        self.login_btn.grid(row=0, column=2, rowspan=2, sticky="e")
+        self.login_btn.grid(row=0, column=3, rowspan=3, sticky="e")
 
         service = ttk.LabelFrame(root, text="服务", padding=10)
         service.pack(fill="x", padx=12, pady=(10, 0))
@@ -235,9 +250,19 @@ class App:
         self.port_entry.pack(side="left")
         ttk.Label(
             port_row,
-            text="把接口地址填到客户端的 Base URL，API Key 填任意非空值。",
+            text="把接口地址填到客户端的 Base URL。",
             foreground=MUTED,
         ).pack(side="left", padx=(10, 0))
+
+        ttk.Label(service, text="API Key", foreground=MUTED).grid(row=3, column=1, sticky="w", padx=(6, 8), pady=(8, 0))
+        self.api_key_var = tk.StringVar(value=str(load_settings().get("api_key") or ""))
+        self.api_key_entry = ttk.Entry(service, textvariable=self.api_key_var)
+        self.api_key_entry.grid(row=3, column=2, sticky="ew", pady=(8, 0))
+        self.copy_key_btn = ttk.Button(service, text="复制", width=12, command=self._on_copy_key)
+        self.copy_key_btn.grid(row=3, column=3, sticky="e", padx=(8, 0), pady=(8, 0))
+        ttk.Label(service, text="空则不校验；填了客户端必须带同一个 Bearer。改完需重新启动服务。", foreground=MUTED).grid(
+            row=4, column=2, columnspan=2, sticky="w", pady=(4, 0)
+        )
 
         # Shown only after a launch failed because Playwright's Chromium is not on this machine.
         self.notice = ttk.Frame(root)
@@ -277,10 +302,12 @@ class App:
         )
 
     def _refresh_account(self) -> None:
+        expiry = ""
         if self._alive("login"):
             self.account_dot.config(foreground=AMBER)
             self.account_text.config(text="等待在浏览器里完成登录…")
             self.account_detail.config(text="登录成功后浏览器会自动关闭，最多等待 5 分钟。")
+            self.account_expiry.config(text="")
             self.login_btn.config(text="取消登录")
             return
         cookie = core.load_cookie()
@@ -290,18 +317,21 @@ class App:
         else:
             claims = core.get_token_claims(cookie)
             exp = core.token_expiry(cookie)
-            detail = f"用户 {claims.get('user_id') or '未知'}　方案 {claims.get('plan') or 'default'}"
+            who = claims.get("email") or claims.get("user_id") or "未知"
+            kind = "邮箱" if claims.get("email") else "用户"
+            detail = f"{kind} {who}　方案 {claims.get('plan') or 'default'}"
             if exp:
-                detail += "　有效期至 " + time.strftime("%Y-%m-%d %H:%M", time.localtime(exp))
+                expiry = "有效期至 " + time.strftime("%Y-%m-%d %H:%M", time.localtime(exp))
             if exp and exp <= time.time():
                 color, text = RED, "登录已过期"
             else:
                 color, text = GREEN, "已登录"
                 if exp:
-                    detail += f"（剩余 {(exp - time.time()) / 3600:.1f} 小时）"
+                    expiry += f"（剩余 {(exp - time.time()) / 3600:.1f} 小时）"
         self.account_dot.config(foreground=color)
         self.account_text.config(text=text)
         self.account_detail.config(text=detail)
+        self.account_expiry.config(text=expiry)
         self.login_btn.config(text="重新登录" if cookie else "登录")
 
     def _refresh_service(self) -> None:
@@ -345,6 +375,12 @@ class App:
     # -- children ----------------------------------------------------------
 
     def _spawn(self, kind: str, *args: str) -> None:
+        env = dict(os.environ, **{CHILD_ENV: "1"})
+        key = self.api_key_var.get().strip()
+        if key:
+            env["PRISM_BRIDGE_API_KEY"] = key
+        else:
+            env.pop("PRISM_BRIDGE_API_KEY", None)
         try:
             proc = subprocess.Popen(
                 self_command(*args),
@@ -355,7 +391,7 @@ class App:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                env=dict(os.environ, **{CHILD_ENV: "1"}),
+                env=env,
                 creationflags=NO_WINDOW,
             )
         except OSError as e:
@@ -473,7 +509,7 @@ class App:
             messagebox.showwarning(APP_TITLE, f"端口 {port} 已被占用。\n桥可能已经在另一个窗口运行；否则请换一个端口。")
             return
         self.port = port
-        save_settings({"port": port})
+        save_settings({"port": port, "api_key": self.api_key_var.get().strip()})
         self.serve_failed = False
         self.health = None
         self._spawn("serve", "serve", "--port", str(port))
@@ -514,6 +550,12 @@ class App:
         self.root.clipboard_append(self.url_var.get())
         self.copy_btn.config(text="已复制")
         self.root.after(1200, lambda: self.copy_btn.config(text="复制"))
+
+    def _on_copy_key(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.api_key_var.get().strip())
+        self.copy_key_btn.config(text="已复制")
+        self.root.after(1200, lambda: self.copy_key_btn.config(text="复制"))
 
     def _port_edited(self, *_) -> None:
         port = parse_port(self.port_var.get())
