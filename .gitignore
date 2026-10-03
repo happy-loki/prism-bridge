@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Never commit a login session or request dumps.
+auth.json
+relay-sessions.json
+dumps/
