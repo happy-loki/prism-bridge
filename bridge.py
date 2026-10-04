@@ -85,8 +85,11 @@ ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("PRISM_ALLOWED_ORIGINS", ""
 # bytes of the JSON-escaped text (the largest of the candidates), kept under the accepted sample.
 MAX_TURN_BYTES = int(os.environ.get("PRISM_MAX_TURN_BYTES", "86000"))
 # A request over that budget is delivered as several turns of one Prism conversation; past this many
-# the caller gets context_length_exceeded and compacts.
+# the caller gets context_length_exceeded. Older history is compacted first (PRISM_COMPACT_MAX_PARTS).
 MAX_TURN_PARTS = int(os.environ.get("PRISM_MAX_TURN_PARTS", "8"))
+# Shrink prior turns so a full replay fits in this many Prism turns. 0: off (caller compact).
+# The current user turn is never shortened.
+COMPACT_MAX_PARTS = int(os.environ.get("PRISM_COMPACT_MAX_PARTS", "2"))
 # Pause between those turns: a burst of turns gets the account refused for minutes.
 PART_GAP_SEC = float(os.environ.get("PRISM_PART_GAP", "8"))
 # A continued conversation gets the tool catalog again after this many characters (0: never).
@@ -1088,24 +1091,52 @@ def request_tenant(headers, body: dict) -> str:
 
 
 
+def _last_user_index(entries: list[dict]) -> int:
+    last = -1
+    for i, entry in enumerate(entries):
+        if entry.get("role") == "user":
+            last = i
+    if last < 0:
+        return max(0, len(entries) - 1)
+    return last
+
+
+def _current_batch_start(entries: list[dict]) -> int:
+    """Last real user question; tool outputs are user-role entries with a call_id."""
+    for i in range(len(entries) - 1, -1, -1):
+        entry = entries[i]
+        if entry.get("role") == "user" and not entry.get("call_id"):
+            return i
+    return _last_user_index(entries)
+
+
+def _current_batch_text(entries: list[dict], reminder: str) -> str:
+    if not entries:
+        return f"Continue.{reminder}"
+    parts = ["【当前提问 / Current Question】", entries[0]["text"]]
+    for entry in entries[1:]:
+        label = "Tool" if entry.get("call_id") else _role_label(entry.get("role") or "")
+        parts.extend(("", f"{label}: {entry['text']}"))
+    parts.append(reminder.lstrip("\n"))
+    return "\n".join(parts)
+
+
+def _role_label(role: str) -> str:
+    return {"assistant": "Assistant", "developer": "System"}.get(role, "User")
+
+
 def flatten_converted_entries(converted_entries: list[dict], reminder: str) -> str:
     """Prism editor turns ignore extra chat roles; pack prior turns into one user prompt."""
     if not converted_entries:
         return f"Continue.{reminder}"
-    last_user_idx = -1
-    for i, entry in enumerate(converted_entries):
-        if entry["role"] == "user":
-            last_user_idx = i
-    if last_user_idx < 0:
-        last_user_idx = len(converted_entries) - 1
+    last_user_idx = _last_user_index(converted_entries)
     current = converted_entries[last_user_idx]["text"]
     prior = converted_entries[:last_user_idx]
     if not prior:
         return f"{current}{reminder}"
     parts = ["【对话历史记录 / Conversation History】"]
     for entry in prior:
-        tag = {"assistant": "Assistant", "developer": "System"}.get(entry["role"], "User")
-        parts.append(f"{tag}: {entry['text']}")
+        parts.append(f"{_role_label(entry['role'])}: {entry['text']}")
         parts.append("")
     parts.append("【当前提问 / Current Question】")
     parts.append(f"{current}{reminder}")
@@ -1352,6 +1383,201 @@ def _part_text(piece: str, index: int, last: bool) -> str:
     return f'{head}\n<relay_part index="{index}">\n{piece}\n</relay_part>'
 
 
+def split_turn_text(text: str, limit: int | None = None) -> list[str]:
+    """Same cuts `_send_parts` uses: one piece under `limit`, else pieces of limit minus wrapper."""
+    limit = MAX_TURN_BYTES if limit is None else limit
+    if transport_size(text) <= limit:
+        return [text]
+    return split_for_transport(text, limit - PART_OVERHEAD_BYTES)
+
+
+def parts_for_transport(text: str, limit: int | None = None) -> int:
+    return len(split_turn_text(text, limit))
+
+
+def _clip_text(text: str, max_bytes: int) -> str:
+    """Keep a prefix/tail of `text` whose JSON-escaped UTF-8 size is at most `max_bytes`."""
+    text = text or ""
+    if max_bytes <= 0:
+        return ""
+    if transport_size(text) <= max_bytes:
+        return text
+
+    def longest_prefix() -> str:
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if transport_size(text[:mid]) <= max_bytes:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo]
+
+    best = longest_prefix()
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        head = max(0, int(mid * 0.7))
+        tail = mid - head
+        if head + tail >= len(text):
+            hi = mid - 1
+            continue
+        omitted = len(text) - head - tail
+        cand = text[:head] + f"\n…[{omitted} chars omitted]…\n" + (text[-tail:] if tail else "")
+        if transport_size(cand) <= max_bytes:
+            best = cand
+            lo = mid
+        else:
+            hi = mid - 1
+    return best
+
+
+def _digest_line(entry: dict, cap: int) -> str:
+    text = entry.get("text") or ""
+    if entry.get("call_id") and entry.get("role") == "user":
+        label, cap = "Tool", min(cap, 400)
+    elif entry.get("role") == "assistant" and "<client_tool_call" in text:
+        label, cap = "Assistant", min(cap, 500)
+    elif entry.get("role") == "user":
+        label, cap = "User", min(cap, 1200)
+    elif entry.get("role") == "assistant":
+        label, cap = "Assistant", min(cap, 600)
+    else:
+        label, cap = _role_label(entry.get("role") or ""), min(cap, 400)
+    return f"{label}: {_clip_text(text, cap)}"
+
+
+def _replay_body(
+    digest: list[dict],
+    digest_cap: int,
+    verbatim: list[dict],
+    current: list[dict],
+    reminder: str,
+    omitted: int,
+) -> str:
+    parts: list[str] = []
+    if digest:
+        parts.append("【压缩上文 / Compacted earlier turns】")
+        parts.append("Earlier turns were shortened by the relay to fit. They are not verbatim.")
+        if omitted:
+            parts.append(f"{omitted} older turns omitted.")
+        for entry in digest:
+            parts.append(_digest_line(entry, digest_cap))
+            parts.append("")
+    elif omitted:
+        parts.append("【压缩上文 / Compacted earlier turns】")
+        parts.append(f"{omitted} earlier turns omitted to fit the turn budget.")
+        parts.append("")
+    if verbatim:
+        parts.append("【近期原文 / Recent turns kept verbatim】")
+        for entry in verbatim:
+            parts.append(f"{_role_label(entry['role'])}: {entry['text']}")
+            parts.append("")
+    parts.append(_current_batch_text(current, reminder))
+    return "\n".join(parts)
+
+
+def compact_converted_entries(entries: list[dict], reminder: str, fits) -> tuple[str, list[dict], dict]:
+    """Shrink prior turns until `fits(body)` (JSON-escaped UTF-8 / same cuts as `_send_parts`).
+    The current user turn is never shortened. `kept` is the entries whose images still apply."""
+    empty = {"compacted": False, "omitted": 0, "verbatim": 0, "digested": 0}
+    if not entries:
+        return f"Continue.{reminder}", [], empty
+    current_start = _current_batch_start(entries)
+    current = entries[current_start:]
+    prior = entries[:current_start]
+    kept_current = list(current)
+    if not prior:
+        return _current_batch_text(current, reminder), kept_current, empty
+
+    def assemble(digest: list[dict], cap: int, verbatim: list[dict], omitted: int) -> str:
+        return _replay_body(digest, cap, verbatim, current, reminder, omitted)
+
+    verbatim: list[dict] = []
+    for entry in reversed(prior):
+        trial = [entry] + verbatim
+        omitted = len(prior) - len(trial)
+        if fits(assemble([], 0, trial, omitted)):
+            verbatim = trial
+        else:
+            break
+    digest = prior[: len(prior) - len(verbatim)]
+    omitted_prefix = 0
+    for cap in (1500, 800, 400, 200, 80):
+        body = assemble(digest, cap, verbatim, omitted_prefix)
+        if fits(body):
+            return body, verbatim + kept_current, {
+                "compacted": True,
+                "omitted": omitted_prefix,
+                "verbatim": len(verbatim),
+                "digested": len(digest),
+            }
+    cap = 80
+    while digest:
+        body = assemble(digest, cap, verbatim, omitted_prefix)
+        if fits(body):
+            return body, verbatim + kept_current, {
+                "compacted": True,
+                "omitted": omitted_prefix,
+                "verbatim": len(verbatim),
+                "digested": len(digest),
+            }
+        drop = max(1, len(digest) // 8)
+        omitted_prefix += drop
+        digest = digest[drop:]
+    body = assemble([], 0, verbatim, len(prior) - len(verbatim))
+    if fits(body):
+        return body, verbatim + kept_current, {
+            "compacted": True,
+            "omitted": len(prior) - len(verbatim),
+            "verbatim": len(verbatim),
+            "digested": 0,
+        }
+    while verbatim:
+        verbatim = verbatim[1:]
+        body = assemble([], 0, verbatim, len(prior) - len(verbatim))
+        if fits(body):
+            return body, verbatim + kept_current, {
+                "compacted": True,
+                "omitted": len(prior) - len(verbatim),
+                "verbatim": len(verbatim),
+                "digested": 0,
+            }
+    return _current_batch_text(current, reminder), kept_current, {
+        "compacted": True,
+        "omitted": len(prior),
+        "verbatim": 0,
+        "digested": 0,
+    }
+
+
+def fit_replay_text(header: str, entries: list[dict], reminder: str) -> tuple[str, list[dict], dict]:
+    """Replay body (no header) and the entries whose images should still be uploaded."""
+    raw = flatten_converted_entries(entries, reminder)
+    idle = {"compacted": False, "omitted": 0, "verbatim": 0, "digested": 0}
+    target = min(COMPACT_MAX_PARTS, MAX_TURN_PARTS)
+    if not entries or target <= 0:
+        return raw, entries, idle
+    current_start = _current_batch_start(entries)
+    if current_start <= 0:
+        return raw, entries, idle
+    current_only = header + _current_batch_text(entries[current_start:], reminder)
+    if parts_for_transport(current_only) > target:
+        return raw, entries, idle
+
+    def fits(body: str) -> bool:
+        return parts_for_transport(header + body) <= target
+
+    body, kept, info = compact_converted_entries(entries, reminder, fits)
+    packed = header + body
+    if not fits(body):
+        return raw, entries, idle
+    if transport_size(packed) >= transport_size(header + raw):
+        return raw, entries, idle
+    info["compacted"] = True
+    return body, kept, info
+
+
 # ---------------------------------------------------------------------------
 # Conversation continuation
 # ---------------------------------------------------------------------------
@@ -1522,7 +1748,23 @@ def build_relay_plan(body: dict, tenant: str = "anon", headers=None, model: str 
     # came back as NONE), so the relay protocol and tool catalog must ride in the user turn.
     header = f"<relay_instructions>\n{directive}\n</relay_instructions>\n\n"
     catalog = _text_hash(directive)
-    full_text = header + flatten_converted_entries(entries, reminder)
+    raw_body = flatten_converted_entries(entries, reminder)
+    full_text = header + raw_body
+    image_entries = entries
+    compact_info = {"compacted": False, "omitted": 0, "verbatim": 0, "digested": 0}
+    if COMPACT_MAX_PARTS > 0 and parts_for_transport(full_text) > min(COMPACT_MAX_PARTS, MAX_TURN_PARTS):
+        replay_body, image_entries, compact_info = fit_replay_text(header, entries, reminder)
+        if compact_info.get("compacted"):
+            full_text = header + replay_body
+            print(
+                "[relay] compact",
+                f"omitted={compact_info['omitted']}",
+                f"digested={compact_info['digested']}",
+                f"verbatim={compact_info['verbatim']}",
+                f"bytes {transport_size(header + raw_body)}->{transport_size(full_text)}",
+                f"parts {parts_for_transport(header + raw_body)}->{parts_for_transport(full_text)}",
+                flush=True,
+            )
     plan = {
         "tenant": tenant,
         "model": model,
@@ -1533,13 +1775,14 @@ def build_relay_plan(body: dict, tenant: str = "anon", headers=None, model: str 
         "full_replay": bool(body.get("instructions")) or bool(tools),
         "full": {
             "text": full_text,
-            "images": _entry_images(entries, full_text),
+            "images": _entry_images(image_entries, full_text),
             "cid": None,  # created when the turn is sent
             "prev": None,
             "since_catalog": len(full_text) - len(header),
             "source": "new",
             # find_continuation never continues these callers: do not fill the project's chat list for them.
             "store": not (tenant == "anon" and CALLER_OWNED_TOOLS),
+            "compacted": bool(compact_info.get("compacted")),
         },
         "delta": None,
     }
@@ -2157,6 +2400,7 @@ class PrismPage:
                 "[relay]",
                 mode,
                 spec["source"],
+                "compacted" if spec.get("compacted") else "raw",
                 "bytes",
                 transport_size(spec["text"]),
                 "cid",
@@ -2189,7 +2433,7 @@ class PrismPage:
         """One request as one Prism turn, or as several when it is over the size Prism takes: each
         earlier part is a turn the model only acknowledges, the last one gets the real answer."""
         limit = MAX_TURN_BYTES
-        pieces = split_for_transport(spec["text"], limit - PART_OVERHEAD_BYTES) if transport_size(spec["text"]) > limit else [spec["text"]]
+        pieces = split_turn_text(spec["text"], limit)
 
         def check_parts(allowed: int) -> None:
             if len(pieces) > allowed:
@@ -2227,6 +2471,7 @@ class PrismPage:
                 if limit < MAX_TURN_BYTES:
                     raise
                 limit = MAX_TURN_BYTES // 2
+                # Earlier delivered parts mean even a single remainder still needs its wrapper.
                 pieces = pieces[:done] + split_for_transport("".join(pieces[done:]), limit - PART_OVERHEAD_BYTES)
                 print(f"[relay] Prism refused the size, retrying in pieces of {limit} bytes", flush=True)
                 continue
@@ -2685,6 +2930,7 @@ class Handler(BaseHTTPRequestHandler):
                 want_stream,
                 "cid",
                 (spec["cid"] or "new")[:24],
+                "compacted" if spec.get("compacted") else "raw",
                 flush=True,
             )
             if DUMP_DIR:
