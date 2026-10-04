@@ -1395,6 +1395,38 @@ def parts_for_transport(text: str, limit: int | None = None) -> int:
     return len(split_turn_text(text, limit))
 
 
+def _text_fits_parts(text: str, max_parts: int, limit: int | None = None) -> bool:
+    budget = MAX_TURN_BYTES if limit is None else limit
+    pieces = split_turn_text(text, budget)
+    if len(pieces) > max_parts:
+        return False
+    if not pieces:
+        return True
+    if len(pieces) == 1:
+        return transport_size(pieces[0]) <= budget
+    for index, piece in enumerate(pieces):
+        sent = _part_text(piece, index + 1, index == len(pieces) - 1)
+        if transport_size(sent) > budget:
+            return False
+    return True
+
+
+def _compact_info(*, compacted: bool = False, omitted: int = 0, verbatim: int = 0, digested: int = 0) -> dict:
+    omitted_start = 0 if omitted else None
+    omitted_end = omitted if omitted else None
+    lost = bool(compacted or omitted or digested)
+    return {
+        "compacted": compacted,
+        "omitted": omitted,
+        "verbatim": verbatim,
+        "digested": digested,
+        "omitted_start": omitted_start,
+        "omitted_end": omitted_end,
+        "source_accessible": False,
+        "source_note": "original text not retained" if lost else "n/a",
+    }
+
+
 def _clip_text(text: str, max_bytes: int) -> str:
     """Keep a prefix/tail of `text` whose JSON-escaped UTF-8 size is at most `max_bytes`."""
     text = text or ""
@@ -1432,19 +1464,90 @@ def _clip_text(text: str, max_bytes: int) -> str:
     return best
 
 
+_EVIDENCE_LINE = re.compile(
+    r"(error|exception|failed|failure|traceback|errno|exit code|"
+    r"http [45]\d\d|eacces|enoent|assert|"
+    r"[a-zA-Z]:\\|/(?:[\w.-]+/){1,}[\w.-]+|"
+    r"\b[\w.-]+\.(?:py|ts|js|tsx|jsx|md|json|toml)\b|"
+    r"目标|约束|失败|错误)",
+    re.I,
+)
+
+
+def _is_real_user_entry(entry: dict) -> bool:
+    return entry.get("role") == "user" and not entry.get("call_id")
+
+
+def _tool_call_ids(entry: dict) -> tuple[str, ...]:
+    if entry.get("role") != "assistant":
+        return ()
+    text = entry.get("text") or ""
+    if "<client_tool_call" not in text:
+        return ()
+    return tuple(
+        match.group(1)
+        for match in re.finditer(r'<client_tool_call\b[^>]*\bid="([^"]*)"', text)
+        if match.group(1)
+    )
+
+
+def _task_batches(entries: list[dict]) -> list[list[dict]]:
+    """Split history on real user questions so a tool call stays with its question and results."""
+    if not entries:
+        return []
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    for entry in entries:
+        if _is_real_user_entry(entry) and current:
+            batches.append(current)
+            current = [entry]
+        else:
+            current.append(entry)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _batch_unfinished(batch: list[dict]) -> bool:
+    called = {cid for entry in batch for cid in _tool_call_ids(entry)}
+    answered = {entry.get("call_id") for entry in batch if entry.get("call_id")}
+    return bool(called - answered)
+
+
+def _clip_digest_text(text: str, max_bytes: int, prefer_evidence: bool) -> str:
+    if not prefer_evidence:
+        return _clip_text(text, max_bytes)
+    if transport_size(text) <= max_bytes:
+        return text
+    evidence = "".join(line for line in text.splitlines(keepends=True) if _EVIDENCE_LINE.search(line))
+    if evidence and transport_size(evidence) <= max_bytes:
+        leftover = max_bytes - transport_size(evidence)
+        if leftover > 24:
+            prefix = _clip_text(text, leftover)
+            if prefix and prefix not in evidence:
+                return prefix.rstrip() + "\n" + evidence
+        return evidence
+    return _clip_text(text, max_bytes)
+
+
 def _digest_line(entry: dict, cap: int) -> str:
     text = entry.get("text") or ""
     if entry.get("call_id") and entry.get("role") == "user":
         label, cap = "Tool", min(cap, 400)
+        clipped = _clip_digest_text(text, cap, True)
     elif entry.get("role") == "assistant" and "<client_tool_call" in text:
         label, cap = "Assistant", min(cap, 500)
+        clipped = _clip_text(text, cap)
     elif entry.get("role") == "user":
         label, cap = "User", min(cap, 1200)
+        clipped = _clip_text(text, cap)
     elif entry.get("role") == "assistant":
         label, cap = "Assistant", min(cap, 600)
+        clipped = _clip_text(text, cap)
     else:
         label, cap = _role_label(entry.get("role") or ""), min(cap, 400)
-    return f"{label}: {_clip_text(text, cap)}"
+        clipped = _clip_text(text, cap)
+    return f"{label}: {clipped}"
 
 
 def _replay_body(
@@ -1480,7 +1583,7 @@ def _replay_body(
 def compact_converted_entries(entries: list[dict], reminder: str, fits) -> tuple[str, list[dict], dict]:
     """Shrink prior turns until `fits(body)` (JSON-escaped UTF-8 / same cuts as `_send_parts`).
     The current user turn is never shortened. `kept` is the entries whose images still apply."""
-    empty = {"compacted": False, "omitted": 0, "verbatim": 0, "digested": 0}
+    empty = _compact_info()
     if not entries:
         return f"Continue.{reminder}", [], empty
     current_start = _current_batch_start(entries)
@@ -1493,89 +1596,134 @@ def compact_converted_entries(entries: list[dict], reminder: str, fits) -> tuple
     def assemble(digest: list[dict], cap: int, verbatim: list[dict], omitted: int) -> str:
         return _replay_body(digest, cap, verbatim, current, reminder, omitted)
 
-    verbatim: list[dict] = []
-    for entry in reversed(prior):
-        trial = [entry] + verbatim
-        omitted = len(prior) - len(trial)
-        if fits(assemble([], 0, trial, omitted)):
-            verbatim = trial
+    prior_batches = _task_batches(prior)
+    pinned_idx = {index for index, batch in enumerate(prior_batches) if _batch_unfinished(batch)}
+
+    def flatten(indexes) -> list[dict]:
+        return [entry for index in sorted(indexes) for entry in prior_batches[index]]
+
+    kept_idx = set(pinned_idx)
+    for index in range(len(prior_batches) - 1, -1, -1):
+        if index in kept_idx:
+            continue
+        trial = kept_idx | {index}
+        verbatim = flatten(trial)
+        if fits(assemble([], 0, verbatim, len(prior) - len(verbatim))):
+            kept_idx.add(index)
         else:
             break
-    digest = prior[: len(prior) - len(verbatim)]
+
+    digest_idx = [index for index in range(len(prior_batches)) if index not in kept_idx]
     omitted_prefix = 0
     for cap in (1500, 800, 400, 200, 80):
-        body = assemble(digest, cap, verbatim, omitted_prefix)
+        digest = flatten(digest_idx)
+        body = assemble(digest, cap, flatten(kept_idx), omitted_prefix)
         if fits(body):
-            return body, verbatim + kept_current, {
-                "compacted": True,
-                "omitted": omitted_prefix,
-                "verbatim": len(verbatim),
-                "digested": len(digest),
-            }
+            verbatim = flatten(kept_idx)
+            return body, verbatim + kept_current, _compact_info(
+                compacted=True,
+                omitted=omitted_prefix,
+                verbatim=len(verbatim),
+                digested=len(digest),
+            )
     cap = 80
-    while digest:
+    while digest_idx:
+        digest = flatten(digest_idx)
+        verbatim = flatten(kept_idx)
         body = assemble(digest, cap, verbatim, omitted_prefix)
         if fits(body):
-            return body, verbatim + kept_current, {
-                "compacted": True,
-                "omitted": omitted_prefix,
-                "verbatim": len(verbatim),
-                "digested": len(digest),
-            }
-        drop = max(1, len(digest) // 8)
-        omitted_prefix += drop
-        digest = digest[drop:]
-    body = assemble([], 0, verbatim, len(prior) - len(verbatim))
-    if fits(body):
-        return body, verbatim + kept_current, {
-            "compacted": True,
-            "omitted": len(prior) - len(verbatim),
-            "verbatim": len(verbatim),
-            "digested": 0,
-        }
-    while verbatim:
-        verbatim = verbatim[1:]
+            return body, verbatim + kept_current, _compact_info(
+                compacted=True,
+                omitted=omitted_prefix,
+                verbatim=len(verbatim),
+                digested=len(digest),
+            )
+        omitted_prefix += len(prior_batches[digest_idx[0]])
+        digest_idx = digest_idx[1:]
+    droppable = [index for index in sorted(kept_idx) if index not in pinned_idx]
+    while droppable:
+        kept_idx.remove(droppable.pop(0))
+        verbatim = flatten(kept_idx)
         body = assemble([], 0, verbatim, len(prior) - len(verbatim))
         if fits(body):
-            return body, verbatim + kept_current, {
-                "compacted": True,
-                "omitted": len(prior) - len(verbatim),
-                "verbatim": len(verbatim),
-                "digested": 0,
-            }
-    return _current_batch_text(current, reminder), kept_current, {
-        "compacted": True,
-        "omitted": len(prior),
-        "verbatim": 0,
-        "digested": 0,
-    }
+            return body, verbatim + kept_current, _compact_info(
+                compacted=True,
+                omitted=len(prior) - len(verbatim),
+                verbatim=len(verbatim),
+                digested=0,
+            )
+    while kept_idx:
+        kept_idx.remove(min(kept_idx))
+        verbatim = flatten(kept_idx)
+        body = assemble([], 0, verbatim, len(prior) - len(verbatim))
+        if fits(body):
+            return body, verbatim + kept_current, _compact_info(
+                compacted=True,
+                omitted=len(prior) - len(verbatim),
+                verbatim=len(verbatim),
+                digested=0,
+            )
+    return _current_batch_text(current, reminder), kept_current, _compact_info(
+        compacted=True,
+        omitted=len(prior),
+        verbatim=0,
+        digested=0,
+    )
+
+
+
+def _compact_replay_candidate(
+    header: str,
+    entries: list[dict],
+    reminder: str,
+    target: int,
+    raw_size: int,
+):
+    def fits(body: str) -> bool:
+        return _text_fits_parts(header + body, target)
+
+    body, kept, info = compact_converted_entries(entries, reminder, fits)
+    if not fits(body):
+        return None
+    if transport_size(header + body) >= raw_size:
+        return None
+    info["compacted"] = True
+    return body, kept, info
 
 
 def fit_replay_text(header: str, entries: list[dict], reminder: str) -> tuple[str, list[dict], dict]:
     """Replay body (no header) and the entries whose images should still be uploaded."""
     raw = flatten_converted_entries(entries, reminder)
-    idle = {"compacted": False, "omitted": 0, "verbatim": 0, "digested": 0}
-    target = min(COMPACT_MAX_PARTS, MAX_TURN_PARTS)
-    if not entries or target <= 0:
+    idle = _compact_info()
+    if not entries or COMPACT_MAX_PARTS <= 0:
         return raw, entries, idle
     current_start = _current_batch_start(entries)
     if current_start <= 0:
         return raw, entries, idle
+    hard_limit = MAX_TURN_PARTS
+    soft_target = min(COMPACT_MAX_PARTS, hard_limit)
+    packed_raw = header + raw
+    raw_size = transport_size(packed_raw)
     current_only = header + _current_batch_text(entries[current_start:], reminder)
-    if parts_for_transport(current_only) > target:
+    current_parts = parts_for_transport(current_only)
+    if _text_fits_parts(packed_raw, soft_target):
         return raw, entries, idle
-
-    def fits(body: str) -> bool:
-        return parts_for_transport(header + body) <= target
-
-    body, kept, info = compact_converted_entries(entries, reminder, fits)
-    packed = header + body
-    if not fits(body):
+    if current_parts <= soft_target:
+        found = _compact_replay_candidate(header, entries, reminder, soft_target, raw_size)
+        if found:
+            return found
+        if _text_fits_parts(packed_raw, hard_limit):
+            return raw, entries, idle
+    if _text_fits_parts(packed_raw, hard_limit):
         return raw, entries, idle
-    if transport_size(packed) >= transport_size(header + raw):
+    if current_parts > hard_limit or not _text_fits_parts(current_only, hard_limit):
         return raw, entries, idle
-    info["compacted"] = True
-    return body, kept, info
+    start_target = max(current_parts, 1)
+    for target in range(hard_limit, start_target - 1, -1):
+        found = _compact_replay_candidate(header, entries, reminder, target, raw_size)
+        if found:
+            return found
+    return raw, entries, idle
 
 
 # ---------------------------------------------------------------------------
@@ -1737,6 +1885,88 @@ def _entry_images(entries: list[dict], text: str) -> list[str]:
     return list(dict.fromkeys(refs))
 
 
+def _log_compact_result(header: str, raw_body: str, full_text: str, compact_info: dict) -> None:
+    omitted_span = "none"
+    if compact_info.get("omitted"):
+        omitted_span = f"{compact_info.get('omitted_start')}..{compact_info.get('omitted_end')}"
+    source_note = compact_info.get("source_note") or "n/a"
+    print(
+        "[relay] compact",
+        f"omitted={omitted_span}",
+        f"digested={compact_info['digested']}",
+        f"verbatim={compact_info['verbatim']}",
+        f"bytes {transport_size(header + raw_body)}->{transport_size(full_text)}",
+        f"parts {parts_for_transport(header + raw_body)}->{parts_for_transport(full_text)}",
+        f"source={source_note}",
+        flush=True,
+    )
+
+
+def ensure_full_spec(plan: dict) -> dict:
+    existing = plan.get("full")
+    if existing is not None:
+        return existing
+    header = plan["header"]
+    entries = plan["entries"]
+    reminder = plan["reminder"]
+    raw_body = flatten_converted_entries(entries, reminder)
+    image_entries = entries
+    compact_info = _compact_info()
+    full_text = header + raw_body
+    soft_target = min(COMPACT_MAX_PARTS, MAX_TURN_PARTS) if COMPACT_MAX_PARTS > 0 else 0
+    if soft_target > 0 and not _text_fits_parts(full_text, soft_target):
+        replay_body, image_entries, compact_info = fit_replay_text(header, entries, reminder)
+        if compact_info.get("compacted"):
+            full_text = header + replay_body
+            _log_compact_result(header, raw_body, full_text, compact_info)
+    compacted = bool(compact_info.get("compacted"))
+    plan["full"] = {
+        "text": full_text,
+        "images": _entry_images(image_entries, full_text),
+        "cid": None,
+        "prev": None,
+        "since_catalog": len(full_text) - len(header),
+        "source": "new",
+        "store": not (plan["tenant"] == "anon" and CALLER_OWNED_TOOLS),
+        "compacted": compacted,
+        "compact_info": compact_info,
+    }
+    return plan["full"]
+
+
+def prepare_send_spec(plan: dict) -> dict:
+    delta = plan.get("delta")
+    if delta is not None and _text_fits_parts(delta["text"], MAX_TURN_PARTS):
+        return delta
+    full = ensure_full_spec(plan)
+    if _text_fits_parts(full["text"], MAX_TURN_PARTS):
+        return full
+    piece_count = parts_for_transport(full["text"])
+    raise PrismTooLarge(
+        f"the request needs {piece_count} Prism turns of {MAX_TURN_BYTES} bytes, the bridge sends at most {MAX_TURN_PARTS} "
+        "(PRISM_MAX_TURN_PARTS)"
+    )
+
+
+def context_length_error(exc: BaseException) -> dict:
+    return {
+        "message": (
+            "Your input exceeds the context window of this model. Please adjust your input "
+            f"and try again. (Prism: {str(exc)[:300]})"
+        ),
+        "type": "invalid_request_error",
+        "code": "context_length_exceeded",
+    }
+
+
+def spec_actual_mode(spec: dict, mode: str) -> str:
+    if mode == "delta":
+        return "delta"
+    if spec.get("compacted"):
+        return "compacted_full"
+    return "raw_full"
+
+
 def build_relay_plan(body: dict, tenant: str = "anon", headers=None, model: str = "") -> dict:
     """What to send upstream for one client request: "full" replays the whole history into a new Prism
     conversation; "delta", when the request extends a stored conversation, sends only the new entries."""
@@ -1744,27 +1974,8 @@ def build_relay_plan(body: dict, tenant: str = "anon", headers=None, model: str 
     directive, reminder = relay_directive(body, tools)
     entries = convert_request_entries(body)
     hashes = entry_prefix_hashes(entries)
-    # Prism stopped passing the developer item to the model (2026-10-03: a codeword placed there
-    # came back as NONE), so the relay protocol and tool catalog must ride in the user turn.
     header = f"<relay_instructions>\n{directive}\n</relay_instructions>\n\n"
     catalog = _text_hash(directive)
-    raw_body = flatten_converted_entries(entries, reminder)
-    full_text = header + raw_body
-    image_entries = entries
-    compact_info = {"compacted": False, "omitted": 0, "verbatim": 0, "digested": 0}
-    if COMPACT_MAX_PARTS > 0 and parts_for_transport(full_text) > min(COMPACT_MAX_PARTS, MAX_TURN_PARTS):
-        replay_body, image_entries, compact_info = fit_replay_text(header, entries, reminder)
-        if compact_info.get("compacted"):
-            full_text = header + replay_body
-            print(
-                "[relay] compact",
-                f"omitted={compact_info['omitted']}",
-                f"digested={compact_info['digested']}",
-                f"verbatim={compact_info['verbatim']}",
-                f"bytes {transport_size(header + raw_body)}->{transport_size(full_text)}",
-                f"parts {parts_for_transport(header + raw_body)}->{parts_for_transport(full_text)}",
-                flush=True,
-            )
     plan = {
         "tenant": tenant,
         "model": model,
@@ -1773,17 +1984,10 @@ def build_relay_plan(body: dict, tenant: str = "anon", headers=None, model: str 
         "catalog": catalog,
         "explicit": _client_conversation_id(body, headers),
         "full_replay": bool(body.get("instructions")) or bool(tools),
-        "full": {
-            "text": full_text,
-            "images": _entry_images(image_entries, full_text),
-            "cid": None,  # created when the turn is sent
-            "prev": None,
-            "since_catalog": len(full_text) - len(header),
-            "source": "new",
-            # find_continuation never continues these callers: do not fill the project's chat list for them.
-            "store": not (tenant == "anon" and CALLER_OWNED_TOOLS),
-            "compacted": bool(compact_info.get("compacted")),
-        },
+        "header": header,
+        "entries": entries,
+        "reminder": reminder,
+        "full": None,
         "delta": None,
     }
     cont = find_continuation(body, entries, hashes, tenant, headers, model)
@@ -1803,6 +2007,8 @@ def build_relay_plan(body: dict, tenant: str = "anon", headers=None, model: str 
             "source": cont["source"],
             "new_entries": len(new),
         }
+        return plan
+    ensure_full_spec(plan)
     return plan
 
 
@@ -1811,7 +2017,9 @@ def remember_turn(plan: dict, result: dict, response_id: str) -> None:
     rid, cid = result.get("rid"), result.get("cid")
     if not CONTINUE_CONVERSATIONS or not rid or not cid or not result.get("continuable"):
         return
-    spec = plan.get(result.get("mode") or "full") or plan["full"]
+    spec = plan.get(result.get("mode") or "full")
+    if not spec:
+        return
     tenant = plan["tenant"]
     text = result.get("text") or ""
     rec = {
@@ -1902,6 +2110,75 @@ class PrismTurnError(RuntimeError):
 
 class PrismTooLarge(PrismTurnError):
     """Prism refused the turn for its size ("conversation_too_large"). Nothing was generated."""
+
+    def __init__(self, message: str, delivered_parts: int = 0):
+        super().__init__(message)
+        self.delivered_parts = delivered_parts
+
+
+class PrismUnexecutedRefusal(RuntimeError):
+    """Structured refusal with evidence the model did not execute. Limited retry may be allowed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        phase: str,
+        retryable: bool = False,
+        http_status: int | None = None,
+        delivered_parts: int = 0,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.phase = phase
+        self.retryable = retryable
+        self.http_status = http_status
+        self.delivered_parts = delivered_parts
+
+
+def _llm_refusal_reason(body: dict) -> str:
+    response = body.get("response")
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    error = body.get("error")
+    error = error if isinstance(error, dict) else {}
+    nested_error = payload.get("error")
+    nested_error = nested_error if isinstance(nested_error, dict) else {}
+    return str(payload.get("reason") or payload.get("code") or nested_error.get("code")
+               or error.get("code") or body.get("reason") or body.get("code") or "")
+
+
+def _llm_execution_evidence(body: dict) -> bool:
+    response = body.get("response")
+    payload = response.get("payload") if isinstance(response, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    active_states = ("in_progress", "queued", "running", "processing", "started")
+    return bool(body.get("request_id") or body.get("turn_state")
+                or body.get("status") in active_states
+                or payload.get("status") in active_states
+                or payload.get("id") or payload.get("output"))
+
+
+def _raise_llm_start_failure(start: dict) -> None:
+    start_status = start.get("status", 500)
+    start_body = start.get("json")
+    start_body = start_body if isinstance(start_body, dict) else {}
+    start_text = (start.get("text") or "")[:300]
+    message = f"llm start HTTP {start_status} {start_text}"
+    if start_status in (401, 403) or _llm_execution_evidence(start_body):
+        raise PrismTurnError(message)
+    reason = _llm_refusal_reason(start_body)
+    if start_status in (400, 404, 409, 410, 422):
+        if reason == "conversation_too_large":
+            raise PrismTooLarge(message)
+        if reason in ("conversation_not_found", "conversation_not_available",
+                      "invalid_previous_response", "invalid_previous_response_id"):
+            raise PrismUnexecutedRefusal(
+                message, reason=reason, phase="start", retryable=True,
+                http_status=start_status)
+    raise PrismTurnError(message)
+
 
 
 class PrismPage:
@@ -2181,47 +2458,16 @@ class PrismPage:
             if not self.cookie:
                 raise RuntimeError("sandbox not ready: no cookie")
             self.boot(self.cookie)
-        waited, delay = 0, 20
-        reloaded = rebooted = False
-        while True:
-            try:
-                return self._chat_once(
-                    input_items,
-                    model,
-                    effort,
-                    images,
-                    conversation_id,
-                    tool_names,
-                    previous_response_id,
-                    listen_snapshot,
-                )
-            except PrismTurnError:
-                raise
-            except PlaywrightError as e:
-                if reloaded:
-                    raise
-                reloaded = True
-                print("[llm] page error, reload and retry:", str(e)[:120], flush=True)
-                self.recover()
-            except RuntimeError as e:
-                msg = str(e)
-                if "403" in msg and "conversation" in msg.lower():
-                    # A rate limit, not a bad conversation id: retrying at once fails again and
-                    # seems to extend the refusal. One attempt per wait, longer each time.
-                    if waited + delay > THROTTLE_WAIT_SEC:
-                        raise PrismTurnError(
-                            f"Prism is rate limiting this account (waited {waited}s): {msg[:160]}"
-                        ) from None
-                    print(f"[llm] Prism throttled the turn, waiting {delay}s ({waited}s so far)", flush=True)
-                    time.sleep(delay)
-                    waited += delay
-                    delay = min(delay + 20, 60)
-                    continue
-                if rebooted:
-                    raise
-                rebooted = True
-                print("[llm] start failed, re-boot and retry:", msg[:120], flush=True)
-                self.boot(self.cookie)
+        return self._chat_once(
+            input_items,
+            model,
+            effort,
+            images,
+            conversation_id,
+            tool_names,
+            previous_response_id,
+            listen_snapshot,
+        )
 
     def _chat_once(
         self,
@@ -2275,7 +2521,7 @@ class PrismPage:
 
         start = start_once()
         if start.get("status", 500) >= 400:
-            raise RuntimeError(f"llm start HTTP {start.get('status')} {start.get('text','')[:300]}")
+            _raise_llm_start_failure(start)
         body = start.get("json") or {}
         keep_snapshot(body)
         err = ((body.get("response") or {}).get("payload") or {}).get("message") or ""
@@ -2289,8 +2535,7 @@ class PrismPage:
             flush=True,
         )
         if "403" in err and "conversation" in err.lower():
-            # chat() waits and resubmits; nothing was generated.
-            raise RuntimeError(err[:300])
+            raise PrismTurnError(err[:300])
 
         def fail_or_text(src: dict, resubmit_ok: bool = False) -> dict | None:
             payload = (src.get("response") or {}).get("payload") or {}
@@ -2331,16 +2576,20 @@ class PrismPage:
                     "tool_calls": tool_calls,
                 }
             msg = payload.get("message") or str(src)[:400]
-            if payload.get("reason") == "conversation_too_large" or "request is too large" in msg.lower():
+            if _llm_refusal_reason(src) == "conversation_too_large" and not payload.get("output"):
                 raise PrismTooLarge(msg)
-            # Rejected at start: nothing was generated, chat() may re-boot and resubmit.
-            # After polling: the turn already ran upstream, resubmitting would bill it twice.
-            # The rate-limit refusal generated nothing in either phase.
-            throttled = "403" in msg and "conversation" in msg.lower()
-            raise (RuntimeError if resubmit_ok or throttled else PrismTurnError)(msg)
+            if resubmit_ok:
+                raise PrismUnexecutedRefusal(
+                    msg,
+                    reason="rejected_at_start",
+                    phase="start",
+                    retryable=False,
+                )
+            raise PrismTurnError(msg)
 
         if body.get("status") == "completed":
-            if "400" in err and "model" in metadata:
+            if (_llm_refusal_reason(body) in ("invalid_model", "model_not_found", "unsupported_model")
+                    and not _llm_execution_evidence(body) and "model" in metadata):
                 # "auto" already means "let Prism pick"; any other id must not be swapped silently.
                 if not ALLOW_MODEL_FALLBACK and upstream_model != "auto":
                     raise PrismTurnError(
@@ -2351,6 +2600,8 @@ class PrismPage:
                 model = "auto"
                 print("[llm] retry without model, reporting model=auto", flush=True)
                 start = start_once()
+                if start.get("status", 500) >= 400:
+                    _raise_llm_start_failure(start)
                 body = start.get("json") or {}
             if body.get("status") == "completed":
                 got = fail_or_text(body, resubmit_ok=True)
@@ -2359,7 +2610,7 @@ class PrismPage:
 
         request_id = body.get("request_id")
         if not request_id:
-            raise RuntimeError(f"no request_id: {str(body)[:300]}")
+            raise PrismTurnError(f"no request_id: {str(body)[:300]}")
         turn_state = body.get("turn_state")
         deadline = time.time() + TURN_TIMEOUT_SEC
         poll_errors = 0
@@ -2393,65 +2644,98 @@ class PrismPage:
     def relay(self, plan: dict, effort: str) -> dict:
         """Answer one client request: continue the stored Prism conversation with only the new
         entries when there is one, otherwise replay the whole history into a new conversation."""
-        modes = (["delta"] if plan.get("delta") else []) + ["full"]
-        for mode in modes:
-            spec = plan[mode]
+        delta = plan.get("delta")
+        if delta is not None and _text_fits_parts(delta["text"], MAX_TURN_PARTS):
             print(
                 "[relay]",
-                mode,
-                spec["source"],
-                "compacted" if spec.get("compacted") else "raw",
+                "delta",
+                delta["source"],
+                "compacted" if delta.get("compacted") else "raw",
                 "bytes",
-                transport_size(spec["text"]),
+                transport_size(delta["text"]),
                 "cid",
-                (spec["cid"] or "new")[:24],
+                (delta["cid"] or "new")[:24],
                 "prev",
-                bool(spec["prev"]),
+                bool(delta["prev"]),
                 flush=True,
             )
             try:
-                result = self._send_parts(spec, plan["model"], effort, plan["tools"])
-            except PrismTooLarge as e:
-                if mode == "full":
+                result = self._send_parts(delta, plan["model"], effort, plan["tools"])
+            except PrismTooLarge as error:
+                if getattr(error, "delivered_parts", 0) > 0:
                     raise
-                # Size refusals generate nothing, so the same request can go into a new conversation.
-                print("[relay] continued conversation refused as too large, replaying:", str(e)[:120], flush=True)
-                continue
-            except PrismTurnError:
-                raise
-            except RuntimeError as e:
-                if mode == "full":
+                print("[relay] continued conversation refused as too large, replaying:", str(error)[:120], flush=True)
+            except PrismUnexecutedRefusal as error:
+                if not error.retryable or error.phase != "start" or getattr(error, "delivered_parts", 0) > 0:
                     raise
-                # Rejected at start (the stored conversation may be gone): nothing was generated.
-                print("[relay] continuing the conversation failed, replaying:", str(e)[:120], flush=True)
-                continue
-            result["mode"] = mode
-            return result
-        raise RuntimeError("no relay mode left")
+                print("[relay] continuing the conversation failed, replaying:", str(error)[:120], flush=True)
+            else:
+                result["mode"] = "delta"
+                print(
+                    "[relay] sent",
+                    f"mode={spec_actual_mode(delta, 'delta')}",
+                    f"parts={result.get('parts')}",
+                    f"bytes={transport_size(delta['text'])}",
+                    flush=True,
+                )
+                return result
+        elif delta is not None:
+            print("[relay] delta exceeds local send cap, using full without upstream delta", flush=True)
+
+        spec = ensure_full_spec(plan)
+        print(
+            "[relay]",
+            "full",
+            spec["source"],
+            "compacted" if spec.get("compacted") else "raw",
+            "bytes",
+            transport_size(spec["text"]),
+            "cid",
+            (spec["cid"] or "new")[:24],
+            "prev",
+            bool(spec["prev"]),
+            flush=True,
+        )
+        result = self._send_parts(spec, plan["model"], effort, plan["tools"])
+        result["mode"] = "full"
+        print(
+            "[relay] sent",
+            f"mode={spec_actual_mode(spec, 'full')}",
+            f"parts={result.get('parts')}",
+            f"bytes={transport_size(spec['text'])}",
+            flush=True,
+        )
+        return result
 
     def _send_parts(self, spec: dict, model: str | None, effort: str, tool_names: list | None) -> dict:
         """One request as one Prism turn, or as several when it is over the size Prism takes: each
         earlier part is a turn the model only acknowledges, the last one gets the real answer."""
         limit = MAX_TURN_BYTES
         pieces = split_turn_text(spec["text"], limit)
+        done = 0
 
         def check_parts(allowed: int) -> None:
-            if len(pieces) > allowed:
+            too_many = len(pieces) > allowed
+            oversized = False
+            if not too_many:
+                for index, piece in enumerate(pieces[done:], start=done):
+                    sent = piece if len(pieces) == 1 else _part_text(piece, index + 1, index == len(pieces) - 1)
+                    if transport_size(sent) > limit:
+                        oversized = True
+                        break
+            if too_many or oversized:
                 raise PrismTooLarge(
                     f"the request needs {len(pieces)} Prism turns of {limit} bytes, the bridge sends at most {allowed} "
-                    "(PRISM_MAX_TURN_PARTS)"
+                    "(PRISM_MAX_TURN_PARTS)",
+                    delivered_parts=done,
                 )
 
-        # Before a conversation is created for a request that will not be sent.
         check_parts(MAX_TURN_PARTS)
-        # A turn nobody will continue needs a stored conversation only if it may have to go in parts.
         store = spec.get("store", True) or transport_size(spec["text"]) > MAX_TURN_BYTES // 2 - PART_OVERHEAD_BYTES
         cid = spec["cid"] or (self.new_conversation() if store else f"cdx1_{uuid.uuid4()}")
         prev, snapshot = spec["prev"], spec.get("snapshot")
         continuable = bool(prev) or cid in self._stored_conversations
-        done = 0
         while True:
-            # Parts only add up in a conversation Prism stores.
             check_parts(MAX_TURN_PARTS if continuable else 1)
             last = done == len(pieces) - 1
             text = pieces[0] if len(pieces) == 1 else _part_text(pieces[done], done + 1, last)
@@ -2466,15 +2750,19 @@ class PrismPage:
                     prev,
                     snapshot,
                 )
-            except PrismTooLarge:
-                # The real limit is not known exactly: cut what is left smaller, once.
+            except PrismTooLarge as error:
                 if limit < MAX_TURN_BYTES:
+                    error.delivered_parts = done
                     raise
                 limit = MAX_TURN_BYTES // 2
-                # Earlier delivered parts mean even a single remainder still needs its wrapper.
                 pieces = pieces[:done] + split_for_transport("".join(pieces[done:]), limit - PART_OVERHEAD_BYTES)
                 print(f"[relay] Prism refused the size, retrying in pieces of {limit} bytes", flush=True)
                 continue
+            except PrismUnexecutedRefusal as error:
+                error.delivered_parts = done
+                if done > 0:
+                    raise PrismTurnError(str(error)) from error
+                raise
             if last:
                 result["parts"] = len(pieces)
                 result["continuable"] = continuable
@@ -2793,6 +3081,26 @@ class Handler(BaseHTTPRequestHandler):
         with self._sse_lock:
             self._sse_write(f"data: {payload}\n\n".encode("utf-8"))
 
+    def _send_error_payload(self, status: int, err: dict, chat_stream: bool, want_stream: bool, rid: str) -> None:
+        if chat_stream:
+            if getattr(self, "_sse_lock", None) is None:
+                self._sse_begin()
+            self._sse_data({"error": err})
+            self._sse_data("[DONE]")
+            return
+        if want_stream:
+            if getattr(self, "_sse_lock", None) is None:
+                self._sse_begin()
+            self._sse(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {"id": rid, "status": "failed", "error": err},
+                },
+            )
+            return
+        self._send(status, {"error": err})
+
     def _reject_foreign(self) -> bool:
         """Local bridge only: refuse cross-site browser posts and DNS-rebinding hosts."""
         if CALLER_OWNED_TOOLS:
@@ -2908,13 +3216,17 @@ class Handler(BaseHTTPRequestHandler):
             chat_stream = bool(body.get("stream")) and path.endswith("chat/completions")
             tenant = request_tenant(self.headers, body)
             plan = build_relay_plan(body, tenant, self.headers, model)
-            spec = plan["delta"] or plan["full"]
+            try:
+                spec = prepare_send_spec(plan)
+            except PrismTooLarge as exc:
+                self._send_error_payload(400, context_length_error(exc), chat_stream, want_stream, "resp_" + uuid.uuid4().hex[:24])
+                return
 
             print(
                 "[http] entries",
                 len(plan["hashes"]),
                 "send",
-                "new" if plan["delta"] else "all",
+                "new" if spec is plan.get("delta") else "all",
                 spec.get("new_entries", len(plan["hashes"])),
                 "chars",
                 len(spec["text"]),
@@ -2931,12 +3243,13 @@ class Handler(BaseHTTPRequestHandler):
                 "cid",
                 (spec["cid"] or "new")[:24],
                 "compacted" if spec.get("compacted") else "raw",
+                spec_actual_mode(spec, "delta" if spec is plan.get("delta") else "full"),
                 flush=True,
             )
             if DUMP_DIR:
                 safe = {k: v for k, v in self.headers.items() if k.lower() not in ("authorization", "cookie", "x-api-key")}
                 debug_dump("request", {"path": path, "headers": safe, "body": body})
-                debug_dump("upstream", {"full": plan["full"], "delta": plan["delta"]})
+                debug_dump("upstream", {"full": plan.get("full"), "delta": plan.get("delta")})
             rid = "resp_" + uuid.uuid4().hex[:24]
             rs_id = "rs_" + uuid.uuid4().hex[:12]
             msg_id = "msg_" + uuid.uuid4().hex[:12]
@@ -2992,30 +3305,8 @@ class Handler(BaseHTTPRequestHandler):
                 stop_hb.set()
                 status, err = 502, {"message": str(e)[:800], "type": "bridge_error"}
                 if isinstance(e, PrismTooLarge):
-                    # The wording and code clients recognise as "context full", so they compact and
-                    # retry instead of stopping on an unknown error.
-                    status, err = 400, {
-                        "message": (
-                            "Your input exceeds the context window of this model. Please adjust your input "
-                            f"and try again. (Prism: {str(e)[:300]})"
-                        ),
-                        "type": "invalid_request_error",
-                        "code": "context_length_exceeded",
-                    }
-                if chat_stream:
-                    self._sse_data({"error": err})
-                    self._sse_data("[DONE]")
-                    return
-                if want_stream:
-                    self._sse(
-                        "response.failed",
-                        {
-                            "type": "response.failed",
-                            "response": {"id": rid, "status": "failed", "error": err},
-                        },
-                    )
-                    return
-                self._send(status, {"error": err})
+                    status, err = 400, context_length_error(e)
+                self._send_error_payload(status, err, chat_stream, want_stream, rid)
                 return
             finally:
                 stop_hb.set()
@@ -3251,20 +3542,45 @@ def cmd_status() -> None:
     print("=" * 64)
 
 
+def _launch_login_context(p):
+    """Use an explicit channel, or installed Windows browsers before bundled Chromium.
+
+    Some existing profiles crash with bundled Chromium in headed mode. Only
+    skip missing browsers: retrying a locked or otherwise failing profile in
+    several different browsers can hide the actual error.
+    """
+    channel = os.environ.get("PRISM_BROWSER_CHANNEL", "").strip()
+    channels = (channel,) if channel else (("chrome", "msedge", None) if os.name == "nt" else (None,))
+    for candidate in channels:
+        label = candidate or "bundled Chromium"
+        print(f"[login] 启动 {label}", flush=True)
+        try:
+            return p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=False,
+                args=["--no-first-run", "--no-default-browser-check"],
+                **({"channel": candidate} if candidate else {}),
+            )
+        except PlaywrightError as exc:
+            message = str(exc)
+            missing = "Executable doesn't exist" in message or (
+                "distribution" in message.lower() and "not found" in message.lower()
+            )
+            if channel or candidate is None or not missing:
+                raise
+            print(f"[login] 未安装 {candidate}，尝试下一个浏览器", flush=True)
+
+
 def cmd_login() -> None:
     print("=" * 64)
     print("           Prism 自动化登录向导")
     print("=" * 64)
-    print("正在启动 Chromium 浏览器，请在弹出的窗口中登录你的 OpenAI 账号...")
+    print("正在启动登录浏览器，请在弹出的窗口中登录你的 OpenAI 账号...")
     print(f"本地 Profile 路径: {PROFILE_DIR}")
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            args=["--no-first-run", "--no-default-browser-check"],
-        )
+        context = _launch_login_context(p)
 
         # Only a still-valid session is worth re-injecting; an expired token must not pass as a login.
         existing_cookie = load_cookie()

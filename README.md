@@ -23,7 +23,7 @@
 - **图片输入**：`input_image` / `image_url` 会先上传到 Prism 项目再交给模型。
 - **会话延续**：客户端每轮重放全部历史，桥只把新增内容发进同一个 Prism 会话。
 - **保活与自愈**：每 5 分钟心跳；页面崩溃自动重载；新账号自动创建工作区。
-- **限流等待**：被 Prism 限流时自动等待重发，期间流不断。
+- **限流与失败保护**：SSE 保持心跳；普通 401/403、超时、断流或执行状态未知时不盲目重发最终作答，遇真人验证应手工处理。
 
 ## 环境
 
@@ -141,9 +141,11 @@ Prism 后端只把 `system` 条目和最后一条 `user` 消息交给模型，�
 
 ## 已知限制
 
-- **限流**：短时间内连发多轮（实测约 25 秒 5 轮）后，Prism 会返回 `Error while processing conversation (403 Forbidden)`，持续几十秒到十几分钟，密集重试会让它更久。桥按 20 / 40 / 60 秒……等待重发，单个请求最多等 `PRISM_THROTTLE_WAIT` 秒。每次工具调用都是一轮，长的 agent 循环会因此变慢。
-- **单轮大小**：Prism 单轮输入约 10 万字符。完整历史重放超过 `PRISM_COMPACT_MAX_PARTS`（默认 2 段）时，桥尝试保留近期原文、截短或省略更早的条目。按 JSON 转义后的 UTF-8 字节数计量，并复用实际发送的分段逻辑验收；这不是模型上下文窗口大小。
-- **自动压缩是有损摘录，不是模型摘要**：不额外调用模型，可能丢失旧细节和旧图片。当前提问不裁剪；只有含协议、工具目录和当前提问的完整候选符合段数目标时才使用，否则保留原始请求走常规分段，仍装不下时返回 `context_length_exceeded`。正常 delta 续接不会因此主动轮换会话；目前验证了离线预算、发送和续接逻辑，未验证真实模型的记忆质量。
+- **限流与未知失败**：短时间内连发多轮（曾实测约 25 秒 5 轮）会被上游拒绝。仅已明确确认未执行的拒绝可有限等待或重试；普通 401/403、超时、断流以及提交后缺少请求 ID 不触发自动重发最终作答。遇真人验证应手工处理，不保证切换浏览器即可通过。
+- **发送大小**：按 JSON 转义后的 UTF-8 文本字节计量，默认每段 86000、最多 8 段，包含协议、工具目录及分段包装；这不是模型 token 窗口。发送前逐段预检，当前保护批次超限时不启动 worker、不建会话、不上传图片。
+- **续接优先**：delta 可发送时不预先构建或压缩备用 full；只有未命中或已确认可安全重放时才准备 full。目录变化仍会在 delta 中刷新，租户、模型和原始历史哈希的续接规则不变。
+- **自动压缩是有损摘录，不是模型摘要**：默认目标 2 段，保留旧版成功候选；旧版能在 8 段内完整发送的历史不新增删减。仅旧候选确实超硬限时自适应放宽目标。当前真实提问、随后的工具调用、结果和图片不裁；`0` 禁止有损压缩。不增加摘要模型调用，不新增摘要持久化，也不保证旧细节或模型记忆无损。
+- **诊断与隐私**：日志记录实际发送路径、段数、字节和历史省略范围，不把备用候选当成已发送；未建立真实归档时明确原文未保留。显式开启调试导出仍会保存请求正文，请自行保管，不将调试目录误认为客户端可访问的归档服务。
 - **聊天列表**：桥创建的会话会出现在你 Prism 项目的聊天列表里，桥不会删除它们。
 - **整段返回**：Prism 生成完才给正文，流式输出里先是心跳，最后一次性给出内容。
 - **上游会变**：这是对网页接口的适配，Prism 改版后可能失效。
@@ -161,14 +163,14 @@ Prism 后端只把 `system` 条目和最后一条 `user` 消息交给模型，�
 | `PRISM_CALLER_OWNED_TOOLS` | `false` | `true`：提示词里说明工具在 HTTP 调用方那边执行，而不是运行桥的这台机器（给网关用） |
 | `PRISM_PROFILE_DIR` | `~/.prism-playwright-profile` | 浏览器数据目录 |
 | `PRISM_AUTH_FILE` | `<PROFILE_DIR>/auth.json` | 登录凭证文件 |
-| `PRISM_BROWSER_CHANNEL` | Linux：`chromium`；其它：空 | Playwright 浏览器通道。空 = 默认的 headless shell |
+| `PRISM_BROWSER_CHANNEL` | 服务：Linux 为 `chromium`，其它为空；登录：Windows 自动选择 | 非空时登录和服务均使用指定通道（如 `chrome`、`msedge`、`chromium`），失败不静默换通道。未指定时 Windows 登录依次选择已安装的 Chrome、Edge，最后才用 bundled Chromium；其它系统登录保持 bundled |
 | `PRISM_TURN_TIMEOUT` | `600` | 单轮最长等待秒数 |
-| `PRISM_THROTTLE_WAIT` | `240` | 单个请求最多为限流等待的秒数 |
-| `PRISM_ALLOW_MODEL_FALLBACK` | 关 | 模型被拒时回退到 Prism 默认模型 |
+| `PRISM_THROTTLE_WAIT` | `240` | 兼容保留并计入 worker 总等待预算；不是上游重发开关，不使普通 401/403 或未知失败自动重试 |
+| `PRISM_ALLOW_MODEL_FALLBACK` | 关 | 显式开启后，仅对没有执行证据的结构化模型拒绝有限回退到默认模型，结果报告 `auto`；不覆盖已有答案 |
 | `PRISM_CONTINUE` | `1` | `0` 关闭会话延续，每轮整段重放进新会话 |
 | `PRISM_MAX_TURN_BYTES` | `86000` | 单轮文本上限（JSON 转义后的字节数） |
 | `PRISM_MAX_TURN_PARTS` | `8` | 一个请求最多拆成几轮 |
-| `PRISM_COMPACT_MAX_PARTS` | `2` | 完整历史重放的压缩段数目标，不超过 `PRISM_MAX_TURN_PARTS`；无法达到则不采用压缩结果；`0` 关闭 |
+| `PRISM_COMPACT_MAX_PARTS` | `2` | 原有摘录目标；旧成功候选优先，仅超出硬限制时自适应放宽，最多到 `PRISM_MAX_TURN_PARTS`；`0` 禁止有损压缩 |
 | `PRISM_PART_GAP` | `8` | 拆分的各轮之间等待的秒数 |
 | `PRISM_CATALOG_REFRESH_CHARS` | `200000` | 续接的会话每增长这么多字符重发一次工具目录，`0` 为不重发 |
 | `PRISM_CLIENT_INSTRUCTIONS_MAX` | `2000` | 超过这个长度的 `instructions` 不转发 |
@@ -198,6 +200,24 @@ python bridge.py serve
 - 一个 Prism 账号的限流是共用的，多人同时用会更容易触发。
 
 ## 常见问题
+
+**登录窗口启动即退出：`TargetClosedError` / `exitCode=2147483651`**
+这是浏览器启动阶段的问题，不能仅凭这个异常判断 Cookie 失效或 Cloudflare 拦截。我们在 Windows 上用公开提交 `26d82ff2246676f0256944280d8352fe5eac67ab` 实测：全新 profile 正常，既有 profile 副本用 bundled Chromium 有头模式会崩溃，改用系统 Chrome 则正常；并非所有用户都会遇到。
+
+新版 Windows 登录优先使用系统 Chrome，再选 Edge，均未安装才用 bundled Chromium。只在浏览器未安装时继续尝试；profile 占用、权限或其它启动错误保留原始报错，不会删除 profile、Cookie 或强杀浏览器。服务模式默认不变。显式设置 `PRISM_BROWSER_CHANNEL` 时尊重该选择，失败不自动换浏览器。
+
+**登录弹出 `auth.openai.com`「正在验证您是否是真人」/ `Just a moment...`，或 JSON 解析报 `Unexpected token '<'`（Issue #1）**
+这是登录/授权阶段拿到了 HTML，不是桥把 Cookie 解析错。本机同一次对照：Playwright 自带 Chromium 点「Continue with OpenAI」后，`GET /api/accounts/authorize` 返回 **403 `text/html`**，标题 `Just a moment...`；系统 Chrome 同一台机器是 **302 → `/log-in` 200**（正常邮箱登录页）。两种启动 `navigator.webdriver` 都是 `true`，去掉 `--enable-automation` 仍是 `true`，所以不能单凭自动化标记解释。
+
+Windows 登录已默认走系统 Chrome，通常不再撞自带 Chromium 这条 403 HTML。若仍出现该页：先看日常 Chrome 能否打开 `prism.openai.com` / `auth.openai.com`；需要登录和服务都用系统 Chrome 时，在同一终端设置后启动：
+
+```powershell
+$env:PRISM_BROWSER_CHANNEL = "chrome"
+python gui.py
+```
+
+或设置后依次执行 `python bridge.py login`、`python bridge.py serve`。系统 Chrome 仍使用本项目独立的 profile，不是日常浏览器的默认个人资料。换浏览器不是绕过验证的保证。
+
 
 **启动报 `net::ERR_CONNECTION_CLOSED`**
 到不了 `prism.openai.com`。
