@@ -171,7 +171,8 @@ Prism 后端只把 `system` 条目和最后一条 `user` 消息交给模型，�
 | `PRISM_MAX_TURN_BYTES` | `86000` | 单轮文本上限（JSON 转义后的字节数） |
 | `PRISM_MAX_TURN_PARTS` | `8` | 一个请求最多拆成几轮 |
 | `PRISM_COMPACT_MAX_PARTS` | `2` | 原有摘录目标；旧成功候选优先，仅超出硬限制时自适应放宽，最多到 `PRISM_MAX_TURN_PARTS`；`0` 禁止有损压缩 |
-| `PRISM_PART_GAP` | `8` | 拆分的各轮之间等待的秒数 |
+| `PRISM_PART_GAP` | `8` | 同一请求拆成多轮时的最小间隔；上一轮已经花掉的时间会抵扣，避免 ACK 后再空等 8 秒 |
+| `PRISM_STATUS_POLL` | `0.4` | 查询当前轮是否结束的间隔秒数；第一次立即查询 |
 | `PRISM_CATALOG_REFRESH_CHARS` | `200000` | 续接的会话每增长这么多字符重发一次工具目录，`0` 为不重发 |
 | `PRISM_CLIENT_INSTRUCTIONS_MAX` | `2000` | 超过这个长度的 `instructions` 不转发 |
 | `PRISM_FORWARD_CLIENT_INSTRUCTIONS` | 关 | 转发任意长度的 `instructions` |

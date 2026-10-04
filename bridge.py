@@ -90,8 +90,11 @@ MAX_TURN_PARTS = int(os.environ.get("PRISM_MAX_TURN_PARTS", "8"))
 # Shrink prior turns so a full replay fits in this many Prism turns. 0: off (caller compact).
 # The current user turn is never shortened.
 COMPACT_MAX_PARTS = int(os.environ.get("PRISM_COMPACT_MAX_PARTS", "2"))
-# Pause between those turns: a burst of turns gets the account refused for minutes.
+# Minimum spacing between Prism turns of one split request. Time already spent on the previous
+# turn counts; a burst of turns still gets the account refused for minutes.
 PART_GAP_SEC = float(os.environ.get("PRISM_PART_GAP", "8"))
+# How often to ask Prism whether the current turn finished. 0 busy-loops.
+STATUS_POLL_SEC = float(os.environ.get("PRISM_STATUS_POLL", "0.4"))
 # A continued conversation gets the tool catalog again after this many characters (0: never).
 CATALOG_REFRESH_CHARS = int(os.environ.get("PRISM_CATALOG_REFRESH_CHARS", "200000"))
 # Off: every request replays the whole history into a new Prism conversation (the old behaviour).
@@ -2614,8 +2617,12 @@ class PrismPage:
         turn_state = body.get("turn_state")
         deadline = time.time() + TURN_TIMEOUT_SEC
         poll_errors = 0
+        poll_delay = max(0.05, STATUS_POLL_SEC) if STATUS_POLL_SEC > 0 else 0.0
+        awaiting = False
         while time.time() < deadline:
-            time.sleep(1.5)
+            if awaiting and poll_delay:
+                time.sleep(poll_delay)
+            awaiting = True
             try:
                 st = self.fetch(
                     "POST",
@@ -2739,6 +2746,7 @@ class PrismPage:
             check_parts(MAX_TURN_PARTS if continuable else 1)
             last = done == len(pieces) - 1
             text = pieces[0] if len(pieces) == 1 else _part_text(pieces[done], done + 1, last)
+            turn_started = time.monotonic()
             try:
                 result = self.chat(
                     upstream_items(text),
@@ -2772,7 +2780,9 @@ class PrismPage:
             cid, prev, snapshot = result["cid"], result["rid"], result.get("snapshot")
             done += 1
             print(f"[relay] part {done}/{len(pieces)} delivered", flush=True)
-            time.sleep(PART_GAP_SEC)
+            remain = PART_GAP_SEC - (time.monotonic() - turn_started)
+            if remain > 0:
+                time.sleep(remain)
 
 
 # ---------------------------------------------------------------------------
@@ -2834,7 +2844,7 @@ class Worker:
                             raise
                         print(f"[init] 连接失败 ({attempt}/3)，5 秒后重试: {str(e)[:100]}", flush=True)
                         time.sleep(5)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(1000)
                 self.prism.page = page
                 self.prism.boot(cookie)
                 self.ready.set()

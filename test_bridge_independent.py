@@ -648,5 +648,51 @@ class IndependentAcceptanceTests(unittest.TestCase):
                         self.assertEqual(failures[0]["status"], "failed")
 
 
+    def test_status_poll_does_not_sleep_before_first_fetch(self):
+        controller = self.fake_controller()
+        responses = [
+            {"status": 200, "json": {"status": "in_progress", "request_id": "req-1"}},
+            {"status": 200, "json": {"status": "completed", "response": {"payload": {
+                "id": "rid-1", "conversationId": "cid-1",
+                "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": "ANSWER"}]}]}}}},
+        ]
+        sleeps = []
+        with patch.object(controller, "fetch", side_effect=responses) as fetch, \
+                patch.object(controller, "upload_pending_images", return_value=[]), \
+                patch.object(controller, "_listen_snapshot", return_value={}), \
+                patch.object(bridge.time, "sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+            result = controller.chat(bridge.upstream_items("NEXT"), "audit-model", "high")
+        self.assertEqual(result["text"], "ANSWER")
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(sleeps, [])
+
+    def test_part_gap_credits_time_already_spent_on_previous_turn(self):
+        controller = self.fake_controller()
+        controller._stored_conversations.add("cid")
+        sleeps = []
+        clock = {"t": 100.0}
+
+        def answer(items, model, effort, images, conversation, tools, previous, snapshot):
+            clock["t"] += 5.0
+            text = items[-1]["content"][0]["text"]
+            return {"text": "ANSWER" if "Final part" in text or "</relay_part>" not in text else "ACK",
+                    "cid": conversation, "rid": f"r{len(sleeps)+1}", "snapshot": {}}
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock["t"] += seconds
+
+        spec = {"text": "A" * 8000 + "\n" + "B" * 8000, "images": [],
+                "cid": "cid", "prev": "r0"}
+        with patch.object(bridge, "MAX_TURN_BYTES", 12000), \
+                patch.object(bridge, "PART_GAP_SEC", 8), \
+                patch.object(bridge.time, "monotonic", side_effect=lambda: clock["t"]), \
+                patch.object(bridge.time, "sleep", side_effect=fake_sleep), \
+                patch.object(controller, "chat", side_effect=answer):
+            result = controller._send_parts(spec, "audit-model", "high", [])
+        self.assertEqual(result["parts"], 2)
+        self.assertEqual(sleeps, [3.0])
+
 if __name__ == "__main__":
     unittest.main()
